@@ -4,17 +4,10 @@ from psycopg2.extras import RealDictCursor
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 
-# Load environment variables from .env file in the current directory or parent
-dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
-if os.path.exists(dotenv_path):
-    load_dotenv(dotenv_path)
-else:
-    # Also try parent directory
-    load_dotenv()
+load_dotenv()
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# Parse PostgreSQL URL - will be called when needed
 db_config = None
 
 def _initialize_db_config():
@@ -24,22 +17,19 @@ def _initialize_db_config():
     
     if not DATABASE_URL:
         raise ValueError(
-            "DATABASE_URL environment variable is not set. "
-            "Please create a .env file in backend_python/ with: "
-            "DATABASE_URL=postgresql://user:password@localhost:5432/fleet_db"
+            "DATABASE_URL environment variable is not set."
         )
     
     parsed_url = urlparse(DATABASE_URL)
     db_config = {
         "host": parsed_url.hostname,
-        "database": parsed_url.path[1:],  # Remove leading /
+        "database": parsed_url.path[1:],
         "user": parsed_url.username,
         "password": parsed_url.password,
         "port": parsed_url.port or 5432,
     }
     return db_config
 
-# Initialize on first use
 def get_db_config():
     global db_config
     if db_config is None:
@@ -47,7 +37,6 @@ def get_db_config():
     return db_config
 
 def get_db():
-    """Get a database connection"""
     config = get_db_config()
     conn = psycopg2.connect(**config)
     try:
@@ -56,16 +45,13 @@ def get_db():
         conn.close()
 
 def get_db_cursor(conn):
-    """Get a cursor from connection"""
     return conn.cursor(cursor_factory=RealDictCursor)
 
 def init_db():
-    """Initialize database schema"""
     config = get_db_config()
     conn = psycopg2.connect(**config)
     cursor = conn.cursor()
     
-    # Create ENUM types
     cursor.execute("""
         DO $$ BEGIN
             CREATE TYPE user_role AS ENUM ('owner', 'operator', 'farmer');
@@ -87,7 +73,6 @@ def init_db():
         END $$;
     """)
     
-    # Create tables
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -182,7 +167,31 @@ def init_db():
             is_resolved BOOLEAN NOT NULL DEFAULT FALSE
         );
     """)
-    
+
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique ON users (phone) WHERE phone IS NOT NULL;
+    """)
+
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS implements_owner_name_unique ON implements (owner_id, name);
+    """)
+
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS operations_active_unique ON operations (tractor_id) WHERE status = 'active';
+    """)
+
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS telemetry_unique ON telemetry (operation_id, tractor_id, timestamp);
+    """)
+
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS fuel_logs_unique ON fuel_logs (tractor_id, timestamp);
+    """)
+
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS alerts_unique ON alerts (tractor_id, operation_id, alert_type, timestamp);
+    """)
+
     conn.commit()
     cursor.close()
     conn.close()

@@ -41,7 +41,6 @@ app.add_middleware(
 )
 
 def dict_from_row(row):
-    """Convert RealDictRow to dict with ISO format for datetime and UUIDs"""
     if row is None:
         return None
     result = {}
@@ -59,12 +58,10 @@ def dict_from_row(row):
     return result
 
 def camel_case(snake_str):
-    """Convert snake_case to camelCase"""
     components = snake_str.split('_')
     return components[0] + ''.join(x.title() for x in components[1:])
 
 def row_to_camel_case(row):
-    """Convert row with snake_case keys to camelCase"""
     if row is None:
         return None
     result = {}
@@ -77,7 +74,6 @@ def row_to_camel_case(row):
             result[camel_case(key)] = value
     return result
 
-# Initialize database on startup
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -86,29 +82,29 @@ async def startup_event():
     except Exception as e:
         print(f"Database initialization error: {e}")
 
-# Auth endpoints
 @app.post("/api/auth/register", response_model=TokenResponse)
 async def register(data: RegisterInput, conn = Depends(get_db)):
     cursor = get_db_cursor(conn)
     
-    # Check if user exists
     cursor.execute("SELECT id FROM users WHERE username = %s", (data.username,))
     if cursor.fetchone():
         raise HTTPException(status_code=400, detail="Username already exists")
     
-    # Create user
     user_id = str(uuid.uuid4())
     hashed_password = get_password_hash(data.password)
+    try:
+        cursor.execute(
+            """INSERT INTO users (id, username, password, full_name, role, phone, is_active)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            (user_id, data.username, hashed_password, data.fullName, 
+             data.role or "operator", data.phone, True)
+        )
+        conn.commit()
+    except psycopg2.IntegrityError as e:
+        conn.rollback()
+        cursor.close()
+        raise HTTPException(status_code=409, detail="User with given username or phone already exists")
     
-    cursor.execute(
-        """INSERT INTO users (id, username, password, full_name, role, phone)
-           VALUES (%s, %s, %s, %s, %s, %s)""",
-        (user_id, data.username, hashed_password, data.fullName, 
-         data.role or "operator", data.phone)
-    )
-    conn.commit()
-    
-    # Fetch user
     cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
     user = cursor.fetchone()
     cursor.close()
@@ -162,7 +158,6 @@ async def login(data: LoginInput, conn = Depends(get_db)):
         }
     }
 
-# Dashboard endpoints
 @app.get("/api/dashboard/stats")
 async def get_dashboard_stats(
     current_user = Depends(get_current_user),
@@ -170,7 +165,6 @@ async def get_dashboard_stats(
 ):
     cursor = get_db_cursor(conn)
     
-    # Get counts
     cursor.execute("SELECT COUNT(*) as count FROM tractors")
     tractors_count = cursor.fetchone()["count"]
     
@@ -183,7 +177,6 @@ async def get_dashboard_stats(
     cursor.execute("SELECT COUNT(*) as count FROM alerts WHERE is_resolved = FALSE")
     unresolved_alerts_count = cursor.fetchone()["count"]
     
-    # Get today's fuel usage
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     tomorrow = today + timedelta(days=1)
     cursor.execute(
@@ -192,7 +185,6 @@ async def get_dashboard_stats(
     )
     today_fuel = cursor.fetchone()["total"]
     
-    # Get recent operations
     cursor.execute(
         """SELECT o.id, o.operation_type, o.status, o.start_time, t.manufacturer_name, t.model, u.full_name
            FROM operations o
@@ -223,14 +215,13 @@ async def get_dashboard_stats(
         "recentOperations": recent_ops
     }
 
-# Tractor endpoints
 @app.get("/api/tractors")
 async def get_tractors(
     current_user = Depends(get_current_user),
     conn = Depends(get_db)
 ):
     cursor = get_db_cursor(conn)
-    cursor.execute("SELECT * FROM tractors")
+    cursor.execute("SELECT * FROM tractors ORDER BY created_at DESC")
     tractors = [row_to_camel_case(row) for row in cursor.fetchall()]
     cursor.close()
     return tractors
@@ -244,14 +235,19 @@ async def create_tractor(
     cursor = get_db_cursor(conn)
     tractor_id = str(uuid.uuid4())
     
-    cursor.execute(
-        """INSERT INTO tractors (id, owner_id, manufacturer_name, model, registration_number, specifications, is_active)
-           VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-        (tractor_id, current_user["id"], data.manufacturerName, data.model, 
-         data.registrationNumber, json.dumps(data.specifications) if data.specifications else None,
-         data.isActive if data.isActive is not None else True)
-    )
-    conn.commit()
+    try:
+        cursor.execute(
+            """INSERT INTO tractors (id, owner_id, manufacturer_name, model, registration_number, specifications, is_active)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            (tractor_id, current_user["id"], data.manufacturerName, data.model, 
+             data.registrationNumber, json.dumps(data.specifications) if data.specifications else None,
+             data.isActive if data.isActive is not None else True)
+        )
+        conn.commit()
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        cursor.close()
+        raise HTTPException(status_code=409, detail="Tractor with given registration number already exists")
     
     cursor.execute("SELECT * FROM tractors WHERE id = %s", (tractor_id,))
     tractor = cursor.fetchone()
@@ -325,14 +321,13 @@ async def delete_tractor(
     cursor.close()
     return {"success": True}
 
-# Implement endpoints
 @app.get("/api/implements")
 async def get_implements(
     current_user = Depends(get_current_user),
     conn = Depends(get_db)
 ):
     cursor = get_db_cursor(conn)
-    cursor.execute("SELECT * FROM implements")
+    cursor.execute("SELECT * FROM implements ORDER BY created_at DESC")
     implements = [row_to_camel_case(row) for row in cursor.fetchall()]
     cursor.close()
     return implements
@@ -346,19 +341,29 @@ async def create_implement(
     cursor = get_db_cursor(conn)
     implement_id = str(uuid.uuid4())
     
-    cursor.execute(
-        """INSERT INTO implements (id, owner_id, operation_type, name, brand_name, working_width, specifications, is_active)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-        (implement_id, current_user["id"], data.operationType, data.name, data.brandName,
-         data.workingWidth, json.dumps(data.specifications) if data.specifications else None,
-         data.isActive if data.isActive is not None else True)
-    )
-    conn.commit()
-    
+    cursor.execute("SELECT id FROM implements WHERE owner_id = %s AND name = %s", (current_user["id"], data.name))
+    if cursor.fetchone():
+        cursor.close()
+        raise HTTPException(status_code=409, detail="Implement with this name already exists for the owner")
+
+    try:
+        cursor.execute(
+            """INSERT INTO implements (id, owner_id, operation_type, name, brand_name, working_width, specifications, is_active)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+            (implement_id, current_user["id"], data.operationType, data.name, data.brandName,
+             data.workingWidth, json.dumps(data.specifications) if data.specifications else None,
+             data.isActive if data.isActive is not None else True)
+        )
+        conn.commit()
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        cursor.close()
+        raise HTTPException(status_code=409, detail="Implement duplicate or constraint violation")
+
     cursor.execute("SELECT * FROM implements WHERE id = %s", (implement_id,))
     implement = cursor.fetchone()
     cursor.close()
-    
+
     return row_to_camel_case(implement)
 
 @app.patch("/api/implements/{implement_id}")
@@ -430,7 +435,6 @@ async def delete_implement(
     cursor.close()
     return {"success": True}
 
-# Operation endpoints
 @app.get("/api/operations")
 async def get_operations(
     current_user = Depends(get_current_user),
@@ -438,7 +442,7 @@ async def get_operations(
 ):
     cursor = get_db_cursor(conn)
     cursor.execute(
-        """SELECT o.*, t.manufacturer_name, t.model, i.name as implement_name, u.full_name
+        """SELECT o.*, t.manufacturer_name, t.model, t.registration_number, i.name as implement_name, i.brand_name, i.working_width, u.full_name
            FROM operations o
            LEFT JOIN tractors t ON o.tractor_id = t.id
            LEFT JOIN implements i ON o.implement_id = i.id
@@ -452,11 +456,14 @@ async def get_operations(
         op["tractor"] = {
             "id": str(row["tractor_id"]),
             "manufacturerName": row["manufacturer_name"],
-            "model": row["model"]
+            "model": row["model"],
+            "registrationNumber": row["registration_number"]
         } if row["tractor_id"] else None
         op["implement"] = {
             "id": str(row["implement_id"]),
-            "name": row["implement_name"]
+            "name": row["implement_name"],
+            "brandName": row["brand_name"],
+            "workingWidth": row["working_width"]
         } if row["implement_id"] else None
         op["operator"] = {
             "fullName": row["full_name"]
@@ -477,27 +484,36 @@ async def create_operation(
     telem_id = str(uuid.uuid4())
     now = datetime.now()
     
-    # Create operation
-    cursor.execute(
-        """INSERT INTO operations (id, tractor_id, implement_id, operator_id, operation_type, status, start_time, notes)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-        (op_id, data.tractorId, data.implementId, current_user["id"], data.operationType, 
-         "active", now, data.notes)
-    )
-    
-    # Create initial telemetry
-    cursor.execute(
-        """INSERT INTO telemetry (id, operation_id, tractor_id, engine_on, pto_on, is_moving, speed, timestamp)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-        (telem_id, op_id, data.tractorId, True, False, False, 0, now)
-    )
-    
-    conn.commit()
-    
+    cursor.execute("SELECT id FROM operations WHERE tractor_id = %s AND status = 'active'", (data.tractorId,))
+    if cursor.fetchone():
+        cursor.close()
+        raise HTTPException(status_code=400, detail="An active operation already exists for this tractor")
+
+    try:
+        cursor.execute(
+            """INSERT INTO operations (id, tractor_id, implement_id, operator_id, operation_type, status, start_time, notes)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+            (op_id, data.tractorId, data.implementId, current_user["id"], data.operationType, 
+             "active", now, data.notes)
+        )
+
+        cursor.execute(
+            """INSERT INTO telemetry (id, operation_id, tractor_id, engine_on, pto_on, is_moving, speed, timestamp)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (operation_id, tractor_id, timestamp) DO NOTHING""",
+            (telem_id, op_id, data.tractorId, True, False, False, 0, now)
+        )
+
+        conn.commit()
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        cursor.close()
+        raise HTTPException(status_code=409, detail="Operation or telemetry conflict occurred")
+
     cursor.execute("SELECT * FROM operations WHERE id = %s", (op_id,))
     operation = cursor.fetchone()
     cursor.close()
-    
+
     return row_to_camel_case(operation)
 
 @app.post("/api/operations/{operation_id}/stop")
@@ -519,13 +535,11 @@ async def stop_operation(
     
     tractor_id = row["tractor_id"]
     
-    # Update operation
     cursor.execute(
         "UPDATE operations SET status = %s, end_time = %s WHERE id = %s",
         ("completed", now, operation_id)
     )
     
-    # Create final telemetry
     cursor.execute(
         """INSERT INTO telemetry (id, operation_id, tractor_id, engine_on, pto_on, is_moving, speed, timestamp)
            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
@@ -540,7 +554,6 @@ async def stop_operation(
     
     return row_to_camel_case(operation)
 
-# Telemetry endpoints
 @app.get("/api/telemetry/{operation_id}")
 async def get_telemetry(
     operation_id: str,
@@ -568,20 +581,25 @@ async def create_telemetry(
     
     cursor.execute(
         """INSERT INTO telemetry (id, operation_id, tractor_id, engine_on, latitude, longitude, is_moving, pto_on, speed, implement_data, timestamp)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+           ON CONFLICT (operation_id, tractor_id, timestamp) DO NOTHING
+           RETURNING *""",
         (telem_id, data.operationId, data.tractorId, data.engineOn, data.latitude, data.longitude,
          data.isMoving or False, data.ptoOn or False, data.speed or 0,
          json.dumps(data.implementData) if data.implementData else None, now)
     )
-    conn.commit()
-    
-    cursor.execute("SELECT * FROM telemetry WHERE id = %s", (telem_id,))
+
     telemetry = cursor.fetchone()
+    if not telemetry:
+        cursor.execute("SELECT * FROM telemetry WHERE operation_id = %s AND tractor_id = %s AND timestamp = %s",
+                       (data.operationId, data.tractorId, now))
+        telemetry = cursor.fetchone()
+
+    conn.commit()
     cursor.close()
-    
+
     return row_to_camel_case(telemetry)
 
-# Fuel log endpoints
 @app.get("/api/fuel-logs")
 async def get_fuel_logs(
     current_user = Depends(get_current_user),
@@ -589,7 +607,7 @@ async def get_fuel_logs(
 ):
     cursor = get_db_cursor(conn)
     cursor.execute(
-        """SELECT f.*, t.registration_number, u.full_name
+        """SELECT f.*, t.registration_number, t.manufacturer_name, t.model, u.full_name
            FROM fuel_logs f
            LEFT JOIN tractors t ON f.tractor_id = t.id
            LEFT JOIN users u ON f.operator_id = u.id
@@ -601,7 +619,9 @@ async def get_fuel_logs(
         log = row_to_camel_case(row)
         log["tractor"] = {
             "id": str(row["tractor_id"]),
-            "registrationNumber": row["registration_number"]
+            "registrationNumber": row["registration_number"],
+            "manufacturerName": row["manufacturer_name"],
+            "model": row["model"]
         } if row["tractor_id"] else None
         log["operator"] = {
             "fullName": row["full_name"]
@@ -623,18 +643,22 @@ async def create_fuel_log(
     
     cursor.execute(
         """INSERT INTO fuel_logs (id, tractor_id, operator_id, operation_id, quantity, notes, timestamp)
-           VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+           VALUES (%s, %s, %s, %s, %s, %s, %s)
+           ON CONFLICT (tractor_id, timestamp) DO NOTHING
+           RETURNING *""",
         (log_id, data.tractorId, current_user["id"], data.operationId, data.quantity, data.notes, now)
     )
-    conn.commit()
-    
-    cursor.execute("SELECT * FROM fuel_logs WHERE id = %s", (log_id,))
+
     fuel_log = cursor.fetchone()
+    if not fuel_log:
+        cursor.execute("SELECT * FROM fuel_logs WHERE tractor_id = %s AND timestamp = %s", (data.tractorId, now))
+        fuel_log = cursor.fetchone()
+
+    conn.commit()
     cursor.close()
-    
+
     return row_to_camel_case(fuel_log)
 
-# Alert endpoints
 @app.get("/api/alerts")
 async def get_alerts(
     current_user = Depends(get_current_user),
@@ -673,15 +697,21 @@ async def create_alert(
     
     cursor.execute(
         """INSERT INTO alerts (id, tractor_id, operation_id, alert_type, message, timestamp)
-           VALUES (%s, %s, %s, %s, %s, %s)""",
+           VALUES (%s, %s, %s, %s, %s, %s)
+           ON CONFLICT (tractor_id, operation_id, alert_type, timestamp) DO NOTHING
+           RETURNING *""",
         (alert_id, data.tractorId, data.operationId, data.alertType, data.message, now)
     )
-    conn.commit()
-    
-    cursor.execute("SELECT * FROM alerts WHERE id = %s", (alert_id,))
+
     alert = cursor.fetchone()
+    if not alert:
+        cursor.execute("SELECT * FROM alerts WHERE tractor_id = %s AND operation_id = %s AND alert_type = %s AND timestamp = %s",
+                       (data.tractorId, data.operationId, data.alertType, now))
+        alert = cursor.fetchone()
+
+    conn.commit()
     cursor.close()
-    
+
     return row_to_camel_case(alert)
 
 @app.post("/api/alerts/{alert_id}/resolve")
@@ -705,7 +735,6 @@ async def resolve_alert(
     
     return row_to_camel_case(alert)
 
-# Reports endpoint
 @app.get("/api/reports")
 async def get_reports(
     filterType: Optional[str] = None,
@@ -734,7 +763,6 @@ async def get_reports(
     
     cursor = get_db_cursor(conn)
     
-    # Get operations
     cursor.execute(
         """SELECT o.*, t.manufacturer_name, t.model, i.working_width, u.full_name
            FROM operations o
@@ -774,7 +802,6 @@ async def get_reports(
             "areaCovered": area_covered
         })
     
-    # Get fuel logs
     cursor.execute(
         "SELECT f.*, t.registration_number FROM fuel_logs f LEFT JOIN tractors t ON f.tractor_id = t.id WHERE f.timestamp >= %s AND f.timestamp <= %s ORDER BY f.timestamp DESC",
         (start, end)
@@ -792,7 +819,6 @@ async def get_reports(
             "timestamp": log["timestamp"].isoformat() if log["timestamp"] else None
         })
     
-    # Get alerts
     cursor.execute(
         "SELECT * FROM alerts WHERE timestamp >= %s AND timestamp <= %s ORDER BY timestamp DESC",
         (start, end)
@@ -824,31 +850,8 @@ async def get_reports(
         "alertLogs": alert_logs
     }
 
-# Static file serving
-client_build_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dist", "public")
-
-if os.path.exists(client_build_path):
-    assets_path = os.path.join(client_build_path, "assets")
-    if os.path.exists(assets_path):
-        app.mount("/assets", StaticFiles(directory=assets_path), name="assets")
-    
-    @app.get("/{full_path:path}")
-    async def serve_spa(request: Request, full_path: str = ""):
-        if full_path.startswith("api"):
-            raise HTTPException(status_code=404, detail="Not found")
-        
-        file_path = os.path.join(client_build_path, full_path)
-        if os.path.isfile(file_path):
-            return FileResponse(file_path)
-        
-        index_path = os.path.join(client_build_path, "index.html")
-        if os.path.exists(index_path):
-            return FileResponse(index_path)
-        
-        raise HTTPException(status_code=404, detail="Not found")
-
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", "5000"))
+    port = int(os.environ.get("PORT", "8000"))
     print(f"Starting FastAPI server on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)
